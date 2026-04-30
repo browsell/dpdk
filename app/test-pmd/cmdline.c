@@ -582,6 +582,10 @@ static void cmd_help_long_parsed(void *parsed_result,
 			"set rxq-fill-threshold (value)\n"
 			"    Set RX queue fill threshold for debug logging (0=disabled).\n"
 
+			"set mainloop-cycle-threshold (value)\n"
+			"    Set mainloop iteration cycle threshold for debug logging (0=disabled).\n"
+			"    Requires record-core-cycles to be enabled.\n"
+
 			"set port (port_id) vf (vf_id) rx|tx on|off\n"
 			"    Enable/Disable a VF receive/transmit from a port\n\n"
 
@@ -8092,6 +8096,46 @@ static cmdline_parse_inst_t cmd_set_rxq_fill_threshold = {
 	},
 };
 
+/* *** SET MAINLOOP CYCLE THRESHOLD *** */
+struct cmd_set_mainloop_cycle_threshold_result {
+	cmdline_fixed_string_t set;
+	cmdline_fixed_string_t mainloop_cycle_threshold;
+	uint64_t threshold;
+};
+
+static void
+cmd_set_mainloop_cycle_threshold_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_set_mainloop_cycle_threshold_result *res = parsed_result;
+
+	set_mainloop_cycle_threshold(res->threshold);
+}
+
+static cmdline_parse_token_string_t cmd_set_mainloop_cycle_threshold_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_mainloop_cycle_threshold_result,
+				 set, "set");
+static cmdline_parse_token_string_t cmd_set_mainloop_cycle_threshold_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_mainloop_cycle_threshold_result,
+				 mainloop_cycle_threshold, "mainloop-cycle-threshold");
+static cmdline_parse_token_num_t cmd_set_mainloop_cycle_threshold_value =
+	TOKEN_NUM_INITIALIZER(struct cmd_set_mainloop_cycle_threshold_result,
+			      threshold, RTE_UINT64);
+
+static cmdline_parse_inst_t cmd_set_mainloop_cycle_threshold = {
+	.f = cmd_set_mainloop_cycle_threshold_parsed,
+	.data = NULL,
+	.help_str = "set mainloop-cycle-threshold <value>: Set mainloop cycle threshold "
+		    "(0=disabled, requires record-core-cycles)",
+	.tokens = {
+		(void *)&cmd_set_mainloop_cycle_threshold_set,
+		(void *)&cmd_set_mainloop_cycle_threshold_name,
+		(void *)&cmd_set_mainloop_cycle_threshold_value,
+		NULL,
+	},
+};
+
 /* *** CONFIGURE UNICAST HASH TABLE *** */
 struct cmd_set_uc_hash_table {
 	cmdline_fixed_string_t set;
@@ -13704,6 +13748,7 @@ static cmdline_parse_ctx_t builtin_ctx[] = {
 	&cmd_set_record_core_cycles,
 	&cmd_set_record_burst_stats,
 	&cmd_set_rxq_fill_threshold,
+	&cmd_set_mainloop_cycle_threshold,
 	&cmd_operate_port,
 	&cmd_operate_specific_port,
 	&cmd_operate_attach_port,

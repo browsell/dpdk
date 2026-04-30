@@ -524,6 +524,17 @@ uint32_t rxq_fill_threshold;
 uint32_t rxq_fill_log_limit = 1000;
 
 /*
+ * Mainloop iteration cycle threshold for debug logging (0 = disabled).
+ * Value is the CPU cycle count for one mainloop iteration.
+ */
+uint64_t mainloop_cycle_threshold;
+
+/*
+ * Mainloop cycle threshold log rate limiting.
+ */
+uint32_t mainloop_log_limit = 1000;
+
+/*
  * Number of ports per shared Rx queue group, 0 disable.
  */
 uint32_t rxq_share;
@@ -2280,9 +2291,27 @@ run_pkt_fwd_on_lcore(struct fwd_lcore *fc, packet_fwd_t pkt_fwd)
 #endif
 		if (record_core_cycles) {
 			uint64_t tsc = rte_rdtsc();
+			uint64_t iter_cycles = tsc - prev_tsc;
 
-			fc->total_cycles += tsc - prev_tsc;
+			fc->total_cycles += iter_cycles;
 			prev_tsc = tsc;
+
+			if (mainloop_cycle_threshold > 0 &&
+			    fc->mainloop_log_count < mainloop_log_limit &&
+			    iter_cycles > mainloop_cycle_threshold) {
+				struct timespec ts;
+				struct tm *tm_info;
+				char time_buf[64];
+
+				clock_gettime(CLOCK_REALTIME, &ts);
+				tm_info = localtime(&ts.tv_sec);
+				strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+				printf("[%s.%09ld] Mainloop iteration exceeded threshold: "
+				       "lcore=%u cycles=%lu threshold=%lu\n",
+				       time_buf, ts.tv_nsec,
+				       rte_lcore_id(), iter_cycles, mainloop_cycle_threshold);
+				fc->mainloop_log_count++;
+			}
 		}
 	} while (! fc->stopped);
 }
@@ -2496,6 +2525,9 @@ start_packet_forwarding(int with_tx_first)
 	}
 
 	fwd_config_setup();
+
+	for (i = 0; i < cur_fwd_config.nb_fwd_lcores; i++)
+		fwd_lcores[i]->mainloop_log_count = 0;
 
 	pkt_fwd_config_display(&cur_fwd_config);
 	if (!pkt_fwd_shared_rxq_check())

@@ -6858,6 +6858,18 @@ set_rxq_fill_threshold(uint32_t threshold)
 	}
 }
 
+void
+set_mainloop_cycle_threshold(uint64_t threshold)
+{
+	lcoreid_t lc_id;
+
+	mainloop_cycle_threshold = threshold;
+
+	/* Reset all per-lcore log counters */
+	for (lc_id = 0; lc_id < nb_fwd_lcores; lc_id++)
+		fwd_lcores[lc_id]->mainloop_log_count = 0;
+}
+
 uint16_t
 str_to_flowtype(const char *string)
 {

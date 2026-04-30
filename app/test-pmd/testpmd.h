@@ -397,6 +397,7 @@ struct fwd_lcore {
 	lcoreid_t  cpuid_idx;    /**< index of logical core in CPU id table */
 	volatile char stopped;   /**< stop forwarding when set */
 	uint64_t total_cycles;   /**< used with --record-core-cycles */
+	uint32_t mainloop_log_count; /**< Mainloop cycle threshold log count */
 };
 
 /*
@@ -509,6 +510,8 @@ extern uint8_t record_core_cycles; /**< Enables measurement of CPU cycles */
 extern uint8_t record_burst_stats; /**< Enables display of RX and TX bursts */
 extern uint32_t rxq_fill_threshold; /**< RX queue fill threshold count (0 = disabled) */
 extern uint32_t rxq_fill_log_limit; /**< Maximum RX queue fill logs allowed */
+extern uint64_t mainloop_cycle_threshold; /**< Mainloop cycle threshold (0 = disabled) */
+extern uint32_t mainloop_log_limit; /**< Maximum mainloop cycle logs allowed */
 extern uint16_t verbose_level; /**< Drives messages being displayed, if any. */
 extern int testpmd_logtype; /**< Log type for testpmd logs */
 extern uint8_t  interactive;
@@ -1144,6 +1147,7 @@ void set_xstats_hide_zero(uint8_t on_off);
 void set_record_core_cycles(uint8_t on_off);
 void set_record_burst_stats(uint8_t on_off);
 void set_rxq_fill_threshold(uint32_t threshold);
+void set_mainloop_cycle_threshold(uint64_t threshold);
 void set_verbose_level(uint16_t vb_level);
 void set_rx_pkt_segments(unsigned int *seg_lengths, unsigned int nb_segs);
 void set_rx_pkt_hdrs(unsigned int *seg_protos, unsigned int nb_segs);
