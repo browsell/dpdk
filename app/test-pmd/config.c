@@ -6843,6 +6843,21 @@ set_record_burst_stats(uint8_t on_off)
 	record_burst_stats = on_off;
 }
 
+void
+set_rxq_fill_threshold(uint32_t threshold)
+{
+	portid_t port_id;
+	queueid_t queue_id;
+
+	rxq_fill_threshold = threshold;
+
+	/* Reset all per-queue log counters */
+	RTE_ETH_FOREACH_DEV(port_id) {
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1; queue_id++)
+			ports[port_id].rxq[queue_id].rxq_fill_log_count = 0;
+	}
+}
+
 uint16_t
 str_to_flowtype(const char *string)
 {

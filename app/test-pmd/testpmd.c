@@ -513,6 +513,17 @@ uint8_t record_core_cycles;
 uint8_t record_burst_stats;
 
 /*
+ * RX queue fill level threshold for debug logging (0 = disabled).
+ * Value is the count of used descriptors in the queue.
+ */
+uint32_t rxq_fill_threshold;
+
+/*
+ * RX queue fill log rate limiting.
+ */
+uint32_t rxq_fill_log_limit = 1000;
+
+/*
  * Number of ports per shared Rx queue group, 0 disable.
  */
 uint32_t rxq_share;
@@ -2474,6 +2485,14 @@ start_packet_forwarding(int with_tx_first)
 	if (test_done == 0) {
 		fprintf(stderr, "Packet forwarding already started\n");
 		return;
+	}
+
+	/* Reset debug log counters */
+	RTE_ETH_FOREACH_DEV(i) {
+		queueid_t queue_id;
+
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1; queue_id++)
+			ports[i].rxq[queue_id].rxq_fill_log_count = 0;
 	}
 
 	fwd_config_setup();

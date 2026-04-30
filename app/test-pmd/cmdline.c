@@ -579,6 +579,9 @@ static void cmd_help_long_parsed(void *parsed_result,
 			"set record-burst-stats on|off\n"
 			"    Set the option to enable display of RX and TX bursts.\n"
 
+			"set rxq-fill-threshold (value)\n"
+			"    Set RX queue fill threshold for debug logging (0=disabled).\n"
+
 			"set port (port_id) vf (vf_id) rx|tx on|off\n"
 			"    Enable/Disable a VF receive/transmit from a port\n\n"
 
@@ -8050,6 +8053,45 @@ static cmdline_parse_inst_t cmd_set_record_burst_stats = {
 	},
 };
 
+/* *** SET RX QUEUE FILL THRESHOLD *** */
+struct cmd_set_rxq_fill_threshold_result {
+	cmdline_fixed_string_t set;
+	cmdline_fixed_string_t rxq_fill_threshold;
+	uint32_t threshold;
+};
+
+static void
+cmd_set_rxq_fill_threshold_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_set_rxq_fill_threshold_result *res = parsed_result;
+
+	set_rxq_fill_threshold(res->threshold);
+}
+
+static cmdline_parse_token_string_t cmd_set_rxq_fill_threshold_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_rxq_fill_threshold_result,
+				 set, "set");
+static cmdline_parse_token_string_t cmd_set_rxq_fill_threshold_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_rxq_fill_threshold_result,
+				 rxq_fill_threshold, "rxq-fill-threshold");
+static cmdline_parse_token_num_t cmd_set_rxq_fill_threshold_value =
+	TOKEN_NUM_INITIALIZER(struct cmd_set_rxq_fill_threshold_result,
+			      threshold, RTE_UINT32);
+
+static cmdline_parse_inst_t cmd_set_rxq_fill_threshold = {
+	.f = cmd_set_rxq_fill_threshold_parsed,
+	.data = NULL,
+	.help_str = "set rxq-fill-threshold <value>: Set RX queue fill threshold (0=disabled)",
+	.tokens = {
+		(void *)&cmd_set_rxq_fill_threshold_set,
+		(void *)&cmd_set_rxq_fill_threshold_name,
+		(void *)&cmd_set_rxq_fill_threshold_value,
+		NULL,
+	},
+};
+
 /* *** CONFIGURE UNICAST HASH TABLE *** */
 struct cmd_set_uc_hash_table {
 	cmdline_fixed_string_t set;
@@ -13661,6 +13703,7 @@ static cmdline_parse_ctx_t builtin_ctx[] = {
 	&cmd_set_xstats_hide_zero,
 	&cmd_set_record_core_cycles,
 	&cmd_set_record_burst_stats,
+	&cmd_set_rxq_fill_threshold,
 	&cmd_operate_port,
 	&cmd_operate_specific_port,
 	&cmd_operate_attach_port,

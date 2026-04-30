@@ -317,6 +317,7 @@ struct xstat_display_info {
 struct port_rxqueue {
 	struct rte_eth_rxconf conf;
 	uint8_t state; /**< RTE_ETH_QUEUE_STATE_* value. */
+	uint32_t rxq_fill_log_count; /**< RX queue fill threshold log count. */
 };
 
 /** TX queue configuration and state. */
@@ -506,6 +507,8 @@ extern uint8_t xstats_hide_zero; /**< Hide zero values for xstats display */
 /* globals used for configuration */
 extern uint8_t record_core_cycles; /**< Enables measurement of CPU cycles */
 extern uint8_t record_burst_stats; /**< Enables display of RX and TX bursts */
+extern uint32_t rxq_fill_threshold; /**< RX queue fill threshold count (0 = disabled) */
+extern uint32_t rxq_fill_log_limit; /**< Maximum RX queue fill logs allowed */
 extern uint16_t verbose_level; /**< Drives messages being displayed, if any. */
 extern int testpmd_logtype; /**< Log type for testpmd logs */
 extern uint8_t  interactive;
@@ -883,6 +886,28 @@ common_fwd_stream_receive(struct fwd_stream *fs, struct rte_mbuf **burst,
 {
 	uint16_t nb_rx;
 
+	if (unlikely(rxq_fill_threshold > 0)) {
+		struct port_rxqueue *rxq = &ports[fs->rx_port].rxq[fs->rx_queue];
+
+		if (rxq->rxq_fill_log_count < rxq_fill_log_limit) {
+			int queue_count = rte_eth_rx_queue_count(fs->rx_port, fs->rx_queue);
+
+			if (queue_count >= 0 && (uint32_t)queue_count >= rxq_fill_threshold) {
+				struct timespec ts;
+				struct tm *tm_info;
+				char time_buf[64];
+
+				clock_gettime(CLOCK_REALTIME, &ts);
+				tm_info = localtime(&ts.tv_sec);
+				strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+				printf("[%s.%09ld] RXQ fill threshold: port=%u queue=%u count=%d threshold=%u\n",
+					time_buf, ts.tv_nsec,
+					fs->rx_port, fs->rx_queue, queue_count, rxq_fill_threshold);
+				rxq->rxq_fill_log_count++;
+			}
+		}
+	}
+
 	nb_rx = rte_eth_rx_burst(fs->rx_port, fs->rx_queue, burst, nb_pkts);
 	if (record_burst_stats)
 		fs->rx_burst_stats.pkt_burst_spread[nb_rx]++;
@@ -1118,6 +1143,7 @@ void set_xstats_hide_zero(uint8_t on_off);
 
 void set_record_core_cycles(uint8_t on_off);
 void set_record_burst_stats(uint8_t on_off);
+void set_rxq_fill_threshold(uint32_t threshold);
 void set_verbose_level(uint16_t vb_level);
 void set_rx_pkt_segments(unsigned int *seg_lengths, unsigned int nb_segs);
 void set_rx_pkt_hdrs(unsigned int *seg_protos, unsigned int nb_segs);
