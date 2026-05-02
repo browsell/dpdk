@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #endif
 #include <sys/types.h>
+#include <sys/syscall.h>
 #include <errno.h>
 #include <stdbool.h>
 
@@ -517,11 +518,7 @@ uint8_t record_burst_stats;
  * Value is the count of used descriptors in the queue.
  */
 uint32_t rxq_fill_threshold;
-
-/*
- * RX queue fill log rate limiting.
- */
-uint32_t rxq_fill_log_limit = 1000;
+uint32_t rxq_fill_event_ring_size = RXQ_FILL_EVENT_RING_DEFAULT;
 
 /*
  * Mainloop iteration cycle threshold for debug logging (0 = disabled).
@@ -529,10 +526,44 @@ uint32_t rxq_fill_log_limit = 1000;
  */
 uint64_t mainloop_cycle_threshold;
 
-/*
- * Mainloop cycle threshold log rate limiting.
- */
-uint32_t mainloop_log_limit = 1000;
+uint32_t mainloop_event_ring_size = MAINLOOP_EVENT_RING_DEFAULT;
+
+uint64_t ref_tsc;
+struct timespec ref_ts;
+
+uint8_t perf_counters_enabled;
+uint8_t pmu_event_enabled[RXQ_FILL_NUM_PMU_COUNTERS];
+__thread struct pmu_state lcore_pmu;
+
+static const uint64_t srf_pmu_events[RXQ_FILL_NUM_PMU_COUNTERS] = {
+	0x7f34, /* MEM_BOUND_STALLS_LOAD.ALL */
+	0x0134, /* MEM_BOUND_STALLS_LOAD.L2_HIT */
+	0x7e34, /* MEM_BOUND_STALLS_LOAD.L2_MISS */
+	0x0634, /* MEM_BOUND_STALLS_LOAD.LLC_HIT */
+	0x7834, /* MEM_BOUND_STALLS_LOAD.LLC_MISS */
+	0x1085, /* ITLB_MISSES.WALK_PENDING */
+	0x1008, /* DTLB_LOAD_MISSES.WALK_PENDING */
+	0x00c0, /* INST_RETIRED.ANY */
+	0x0473, /* TOPDOWN_BAD_SPECULATION.MISPREDICT */
+	0x00c5, /* BR_MISP_RETIRED.ALL_BRANCHES */
+	0x0126, /* L2_LINES_OUT.SILENT */
+	0x0226, /* L2_LINES_OUT.NON_SILENT */
+};
+
+static const char * const srf_pmu_names[RXQ_FILL_NUM_PMU_COUNTERS] = {
+	"mem_stall",
+	"l2_hit",
+	"l2_miss",
+	"llc_hit",
+	"llc_miss",
+	"itlb_walk",
+	"dtlb_walk",
+	"inst_ret",
+	"br_mispredict",
+	"br_misp_ret",
+	"l2_evict_silent",
+	"l2_evict_dirty",
+};
 
 /*
  * Number of ports per shared Rx queue group, 0 disable.
@@ -1684,6 +1715,16 @@ init_config(void)
 								"failed\n");
 		}
 		fwd_lcores[lc_id]->cpuid_idx = lc_id;
+		fwd_lcores[lc_id]->mainloop_events =
+			rte_zmalloc_socket("testpmd: mainloop_events",
+				    sizeof(struct mainloop_event) *
+				    mainloop_event_ring_size,
+				    RTE_CACHE_LINE_SIZE,
+				    rte_lcore_to_socket_id(
+					    fwd_lcores_cpuids[lc_id]));
+		if (fwd_lcores[lc_id]->mainloop_events == NULL)
+			rte_exit(EXIT_FAILURE,
+				 "rte_zmalloc_socket(mainloop_events) failed\n");
 	}
 
 	RTE_ETH_FOREACH_DEV(pid) {
@@ -2151,6 +2192,250 @@ fwd_stats_display(void)
 }
 
 void
+mainloop_cycle_stats_display(void)
+{
+	uint64_t tsc_hz;
+	lcoreid_t lc_id;
+
+	if (mainloop_cycle_threshold == 0) {
+		printf("Mainloop cycle threshold is disabled (set to 0)\n");
+		return;
+	}
+
+	if (!record_core_cycles) {
+		printf("record-core-cycles is not enabled\n");
+		return;
+	}
+
+	tsc_hz = rte_get_tsc_hz();
+
+	printf("\n  Mainloop cycle threshold: %" PRIu64 "\n", mainloop_cycle_threshold);
+
+	for (lc_id = 0; lc_id < cur_fwd_config.nb_fwd_lcores; lc_id++) {
+		struct fwd_lcore *fc = fwd_lcores[lc_id];
+		uint32_t count = fc->mainloop_event_idx;
+		uint32_t n_events;
+		uint32_t i;
+
+		printf("\n  --- lcore %u (cpu %u) ---\n",
+		       lc_id, fwd_lcores_cpuids[fc->cpuid_idx]);
+		printf("  exceed count: %u  max cycles: %" PRIu64 "\n",
+		       fc->mainloop_exceed_count, fc->mainloop_max_cycles);
+
+		if (count == 0) {
+			printf("  no events recorded\n");
+			continue;
+		}
+
+		n_events = count < mainloop_event_ring_size ?
+			count : mainloop_event_ring_size;
+
+		printf("  recent events (newest first):\n");
+		uint64_t prev_ev_tsc = 0;
+
+		for (i = 0; i < n_events; i++) {
+			uint32_t idx = (count - 1 - i) %
+				mainloop_event_ring_size;
+			struct mainloop_event *ev =
+				&fc->mainloop_events[idx];
+			double secs_ago;
+			struct timespec ev_ts;
+			struct tm *tm_info;
+			char time_buf[64];
+			char gap_buf[32];
+
+			if (ev->tsc == 0)
+				continue;
+
+			secs_ago = (double)(ev->tsc - ref_tsc) / tsc_hz;
+			ev_ts.tv_sec = ref_ts.tv_sec + (time_t)secs_ago;
+			ev_ts.tv_nsec = ref_ts.tv_nsec +
+				(long)((secs_ago - (time_t)secs_ago) * 1E9);
+			while (ev_ts.tv_nsec < 0) {
+				ev_ts.tv_sec--;
+				ev_ts.tv_nsec += 1000000000L;
+			}
+			while (ev_ts.tv_nsec >= 1000000000L) {
+				ev_ts.tv_sec++;
+				ev_ts.tv_nsec -= 1000000000L;
+			}
+
+			if (prev_ev_tsc != 0) {
+				double gap_us = (double)(prev_ev_tsc - ev->tsc)
+					* 1E6 / tsc_hz;
+				snprintf(gap_buf, sizeof(gap_buf),
+					 " gap=%.3f us", gap_us);
+			} else {
+				gap_buf[0] = '\0';
+			}
+			prev_ev_tsc = ev->tsc;
+
+			tm_info = localtime(&ev_ts.tv_sec);
+			strftime(time_buf, sizeof(time_buf),
+				 "%Y-%m-%d %H:%M:%S", tm_info);
+			printf("    [%s.%09ld] cycles=%" PRIu64
+			       " (%.3f us)%s\n",
+			       time_buf, ev_ts.tv_nsec, ev->cycles,
+			       (double)ev->cycles * 1E6 / tsc_hz,
+			       gap_buf);
+		}
+	}
+	printf("\n");
+}
+
+void
+mainloop_cycle_stats_reset(void)
+{
+	lcoreid_t lc_id;
+
+	for (lc_id = 0; lc_id < cur_fwd_config.nb_fwd_lcores; lc_id++) {
+		memset(fwd_lcores[lc_id]->mainloop_events, 0,
+		       sizeof(struct mainloop_event) * mainloop_event_ring_size);
+		fwd_lcores[lc_id]->mainloop_event_idx = 0;
+		fwd_lcores[lc_id]->mainloop_exceed_count = 0;
+		fwd_lcores[lc_id]->mainloop_max_cycles = 0;
+	}
+	printf("Mainloop cycle stats cleared\n");
+}
+
+void
+rxq_fill_stats_display(void)
+{
+	uint64_t tsc_hz;
+	portid_t port_id;
+
+	if (rxq_fill_threshold == 0) {
+		printf("RXQ fill threshold is disabled (set to 0)\n");
+		return;
+	}
+
+	tsc_hz = rte_get_tsc_hz();
+
+	printf("\n  RXQ fill threshold: %u\n", rxq_fill_threshold);
+
+	RTE_ETH_FOREACH_DEV(port_id) {
+		queueid_t queue_id;
+
+		for (queue_id = 0; queue_id < nb_rxq; queue_id++) {
+			struct port_rxqueue *rxq =
+				&ports[port_id].rxq[queue_id];
+			uint32_t count = rxq->rxq_fill_event_idx;
+			uint32_t n_events;
+			uint32_t i;
+
+			if (rxq->rxq_fill_exceed_count == 0)
+				continue;
+
+			printf("\n  --- port %u queue %u ---\n",
+			       port_id, queue_id);
+			printf("  exceed count: %u  max queue fill: %u\n",
+			       rxq->rxq_fill_exceed_count,
+			       rxq->rxq_fill_max_count);
+
+			if (rxq->rxq_fill_events == NULL || count == 0)
+				continue;
+
+			n_events = count < rxq_fill_event_ring_size ?
+				count : rxq_fill_event_ring_size;
+
+			if (count >= rxq_fill_event_ring_size)
+				printf("  buffer full (%u events"
+				       " total, showing first %u)\n",
+				       rxq->rxq_fill_exceed_count,
+				       n_events);
+			printf("  events (oldest first):\n");
+
+			for (i = 0; i < n_events; i++) {
+				struct rxq_fill_event *ev =
+					&rxq->rxq_fill_events[i];
+				double secs_ago;
+				struct timespec ev_ts;
+				struct tm *tm_info;
+				char time_buf[64];
+				char gap_buf[32];
+
+				if (ev->tsc == 0)
+					continue;
+
+				secs_ago = (double)(ev->tsc - ref_tsc) /
+					tsc_hz;
+				ev_ts.tv_sec = ref_ts.tv_sec +
+					(time_t)secs_ago;
+				ev_ts.tv_nsec = ref_ts.tv_nsec +
+					(long)((secs_ago - (time_t)secs_ago)
+					       * 1E9);
+				while (ev_ts.tv_nsec < 0) {
+					ev_ts.tv_sec--;
+					ev_ts.tv_nsec += 1000000000L;
+				}
+				while (ev_ts.tv_nsec >= 1000000000L) {
+					ev_ts.tv_sec++;
+					ev_ts.tv_nsec -= 1000000000L;
+				}
+
+				if (ev->gap_tsc > 0) {
+					double gap_us =
+						(double)ev->gap_tsc
+						* 1E6 / tsc_hz;
+					snprintf(gap_buf, sizeof(gap_buf),
+						 " gap=%.3f us", gap_us);
+				} else {
+					gap_buf[0] = '\0';
+				}
+
+				tm_info = localtime(&ev_ts.tv_sec);
+				strftime(time_buf, sizeof(time_buf),
+					 "%Y-%m-%d %H:%M:%S", tm_info);
+				printf("    [%s.%09ld] fill=%u"
+				       " rx=%u%s",
+				       time_buf, ev_ts.tv_nsec,
+				       ev->queue_count,
+				       ev->nb_rx, gap_buf);
+				if (perf_counters_enabled) {
+					int j;
+
+					for (j = 0; j < RXQ_FILL_NUM_PMU_COUNTERS; j++) {
+						if (pmu_event_enabled[j])
+							printf(" %s=%" PRIu64,
+							       srf_pmu_names[j],
+							       ev->pmu[j]);
+					}
+				}
+				printf("\n");
+			}
+		}
+	}
+	printf("\n");
+}
+
+void
+rxq_fill_stats_reset(void)
+{
+	portid_t port_id;
+
+	RTE_ETH_FOREACH_DEV(port_id) {
+		queueid_t queue_id;
+
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1;
+		     queue_id++) {
+			struct port_rxqueue *rxq =
+				&ports[port_id].rxq[queue_id];
+
+			if (rxq->rxq_fill_events != NULL)
+				memset(rxq->rxq_fill_events, 0,
+				       sizeof(struct rxq_fill_event) *
+				       rxq_fill_event_ring_size);
+			rxq->rxq_fill_event_idx = 0;
+			rxq->rxq_fill_exceed_count = 0;
+			rxq->rxq_fill_max_count = 0;
+			rxq->rxq_fill_armed = 1;
+			rxq->rxq_fill_prev_poll_tsc = 0;
+		}
+	}
+	printf("RXQ fill stats cleared\n");
+}
+
+void
 fwd_stats_reset(void)
 {
 	streamid_t sm_id;
@@ -2237,6 +2522,145 @@ flush_fwd_rx_queues(void)
 	}
 }
 
+void
+set_perf_events(const char *event_list)
+{
+	char buf[256];
+	char *tok, *saveptr;
+	int i;
+
+	if (!strcmp(event_list, "all")) {
+		for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++)
+			pmu_event_enabled[i] = 1;
+		perf_counters_enabled = 1;
+		printf("All perf events enabled:");
+		for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++)
+			printf(" %s", srf_pmu_names[i]);
+		printf("\n");
+		return;
+	}
+
+	if (!strcmp(event_list, "none")) {
+		for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++)
+			pmu_event_enabled[i] = 0;
+		perf_counters_enabled = 0;
+		printf("All perf events disabled\n");
+		return;
+	}
+
+	for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++)
+		pmu_event_enabled[i] = 0;
+
+	strlcpy(buf, event_list, sizeof(buf));
+	tok = strtok_r(buf, ",", &saveptr);
+	while (tok != NULL) {
+		while (*tok == ' ')
+			tok++;
+		int found = 0;
+
+		for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++) {
+			if (!strcmp(tok, srf_pmu_names[i])) {
+				pmu_event_enabled[i] = 1;
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			fprintf(stderr, "Unknown perf event: %s\n", tok);
+		tok = strtok_r(NULL, ",", &saveptr);
+	}
+
+	perf_counters_enabled = 0;
+	printf("Perf events enabled:");
+	for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++) {
+		if (pmu_event_enabled[i]) {
+			printf(" %s", srf_pmu_names[i]);
+			perf_counters_enabled = 1;
+		}
+	}
+	if (!perf_counters_enabled)
+		printf(" (none)");
+	printf("\n");
+}
+
+static long
+perf_event_open(struct perf_event_attr *attr, pid_t pid,
+		int cpu, int group_fd, unsigned long flags)
+{
+	return syscall(SYS_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static void
+pmu_init_lcore(void)
+{
+	int i;
+
+	memset(&lcore_pmu, 0, sizeof(lcore_pmu));
+
+	if (!perf_counters_enabled)
+		return;
+
+	printf("Initializing PMU counters on lcore %u...\n", rte_lcore_id());
+
+	for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++) {
+		struct perf_event_attr attr;
+		int fd;
+		void *addr;
+
+		if (!pmu_event_enabled[i])
+			continue;
+
+		memset(&attr, 0, sizeof(attr));
+		attr.type = PERF_TYPE_RAW;
+		attr.size = sizeof(attr);
+		attr.config = srf_pmu_events[i];
+		attr.disabled = 0;
+		attr.exclude_kernel = 1;
+		attr.exclude_hv = 1;
+
+		fd = perf_event_open(&attr, 0, -1, -1, 0);
+		if (fd < 0) {
+			fprintf(stderr, "perf_event_open failed for %s: %s\n",
+				srf_pmu_names[i], strerror(errno));
+			return;
+		}
+
+		addr = mmap(NULL, getpagesize(), PROT_READ, MAP_SHARED, fd, 0);
+		if (addr == MAP_FAILED) {
+			fprintf(stderr, "mmap failed for %s: %s\n",
+				srf_pmu_names[i], strerror(errno));
+			close(fd);
+			return;
+		}
+
+		lcore_pmu.counters[i].fd = fd;
+		lcore_pmu.counters[i].mmap_page = addr;
+	}
+	lcore_pmu.enabled = true;
+	for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++)
+		lcore_pmu.prev[i] = pmu_read(&lcore_pmu.counters[i]);
+	printf("PMU counters initialized on lcore %u (%d events)\n",
+	       rte_lcore_id(), RXQ_FILL_NUM_PMU_COUNTERS);
+}
+
+static void
+pmu_cleanup_lcore(void)
+{
+	int i;
+
+	for (i = 0; i < RXQ_FILL_NUM_PMU_COUNTERS; i++) {
+		if (lcore_pmu.counters[i].mmap_page != NULL) {
+			munmap(lcore_pmu.counters[i].mmap_page, getpagesize());
+			lcore_pmu.counters[i].mmap_page = NULL;
+		}
+		if (lcore_pmu.counters[i].fd > 0) {
+			close(lcore_pmu.counters[i].fd);
+			lcore_pmu.counters[i].fd = 0;
+		}
+	}
+	lcore_pmu.enabled = false;
+}
+
 static void
 run_pkt_fwd_on_lcore(struct fwd_lcore *fc, packet_fwd_t pkt_fwd)
 {
@@ -2256,6 +2680,7 @@ run_pkt_fwd_on_lcore(struct fwd_lcore *fc, packet_fwd_t pkt_fwd)
 #endif
 	fsm = &fwd_streams[fc->stream_idx];
 	nb_fs = fc->stream_nb;
+	pmu_init_lcore();
 	prev_tsc = rte_rdtsc();
 	do {
 		for (sm_id = 0; sm_id < nb_fs; sm_id++) {
@@ -2297,23 +2722,19 @@ run_pkt_fwd_on_lcore(struct fwd_lcore *fc, packet_fwd_t pkt_fwd)
 			prev_tsc = tsc;
 
 			if (mainloop_cycle_threshold > 0 &&
-			    fc->mainloop_log_count < mainloop_log_limit &&
 			    iter_cycles > mainloop_cycle_threshold) {
-				struct timespec ts;
-				struct tm *tm_info;
-				char time_buf[64];
-
-				clock_gettime(CLOCK_REALTIME, &ts);
-				tm_info = localtime(&ts.tv_sec);
-				strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-				printf("[%s.%09ld] Mainloop iteration exceeded threshold: "
-				       "lcore=%u cycles=%lu threshold=%lu\n",
-				       time_buf, ts.tv_nsec,
-				       rte_lcore_id(), iter_cycles, mainloop_cycle_threshold);
-				fc->mainloop_log_count++;
+				uint32_t idx = fc->mainloop_event_idx %
+					mainloop_event_ring_size;
+				fc->mainloop_events[idx].tsc = tsc;
+				fc->mainloop_events[idx].cycles = iter_cycles;
+				fc->mainloop_event_idx++;
+				fc->mainloop_exceed_count++;
+				if (iter_cycles > fc->mainloop_max_cycles)
+					fc->mainloop_max_cycles = iter_cycles;
 			}
 		}
 	} while (! fc->stopped);
+	pmu_cleanup_lcore();
 }
 
 static int
@@ -2516,18 +2937,42 @@ start_packet_forwarding(int with_tx_first)
 		return;
 	}
 
-	/* Reset debug log counters */
+	/* Reset/allocate rxq fill event ring buffers */
 	RTE_ETH_FOREACH_DEV(i) {
 		queueid_t queue_id;
 
-		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1; queue_id++)
-			ports[i].rxq[queue_id].rxq_fill_log_count = 0;
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1; queue_id++) {
+			struct port_rxqueue *rxq = &ports[i].rxq[queue_id];
+
+			if (rxq->rxq_fill_events == NULL) {
+				rxq->rxq_fill_events = rte_zmalloc_socket(
+					"testpmd: rxq_fill_events",
+					sizeof(struct rxq_fill_event) *
+					rxq_fill_event_ring_size,
+					RTE_CACHE_LINE_SIZE,
+					ports[i].socket_id);
+			} else {
+				memset(rxq->rxq_fill_events, 0,
+				       sizeof(struct rxq_fill_event) *
+				       rxq_fill_event_ring_size);
+			}
+			rxq->rxq_fill_event_idx = 0;
+			rxq->rxq_fill_exceed_count = 0;
+			rxq->rxq_fill_max_count = 0;
+			rxq->rxq_fill_armed = 1;
+			rxq->rxq_fill_prev_poll_tsc = 0;
+		}
 	}
 
 	fwd_config_setup();
 
-	for (i = 0; i < cur_fwd_config.nb_fwd_lcores; i++)
-		fwd_lcores[i]->mainloop_log_count = 0;
+	for (i = 0; i < cur_fwd_config.nb_fwd_lcores; i++) {
+		memset(fwd_lcores[i]->mainloop_events, 0,
+		       sizeof(struct mainloop_event) * mainloop_event_ring_size);
+		fwd_lcores[i]->mainloop_event_idx = 0;
+		fwd_lcores[i]->mainloop_exceed_count = 0;
+		fwd_lcores[i]->mainloop_max_cycles = 0;
+	}
 
 	pkt_fwd_config_display(&cur_fwd_config);
 	if (!pkt_fwd_shared_rxq_check())
@@ -2564,6 +3009,9 @@ start_packet_forwarding(int with_tx_first)
 	}
 
 	test_done = 0;
+
+	ref_tsc = rte_rdtsc();
+	clock_gettime(CLOCK_REALTIME, &ref_ts);
 
 	if(!no_flush_rx)
 		flush_fwd_rx_queues();

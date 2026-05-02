@@ -15,6 +15,7 @@
 #endif
 #include <rte_os_shim.h>
 #include <rte_ethdev.h>
+#include <linux/perf_event.h>
 #include <rte_flow.h>
 #include <rte_mbuf_dyn.h>
 
@@ -313,11 +314,66 @@ struct xstat_display_info {
 	bool	 allocated;
 };
 
+#define RXQ_FILL_EVENT_RING_DEFAULT 128
+#define RXQ_FILL_NUM_PMU_COUNTERS 12
+
+struct pmu_counter {
+	int fd;
+	struct perf_event_mmap_page *mmap_page;
+};
+
+struct pmu_state {
+	struct pmu_counter counters[RXQ_FILL_NUM_PMU_COUNTERS];
+	uint64_t prev[RXQ_FILL_NUM_PMU_COUNTERS];
+	bool enabled;
+};
+
+static inline uint64_t
+pmu_read(struct pmu_counter *c)
+{
+	struct perf_event_mmap_page *p = c->mmap_page;
+	uint32_t seq, idx;
+	uint64_t count;
+
+	if (p == NULL)
+		return 0;
+
+	do {
+		seq = p->lock;
+		__sync_synchronize();
+		idx = p->index;
+		if (idx) {
+			uint32_t lo, hi;
+
+			asm volatile("rdpmc" :
+				     "=a"(lo), "=d"(hi) : "c"(idx - 1));
+			count = p->offset + ((uint64_t)hi << 32 | lo);
+		} else {
+			count = 0;
+		}
+		__sync_synchronize();
+	} while (p->lock != seq);
+	return count;
+}
+
+struct rxq_fill_event {
+	uint64_t tsc;
+	uint64_t gap_tsc;
+	uint32_t queue_count;
+	uint16_t nb_rx;
+	uint64_t pmu[RXQ_FILL_NUM_PMU_COUNTERS];
+};
+
 /** RX queue configuration and state. */
 struct port_rxqueue {
 	struct rte_eth_rxconf conf;
 	uint8_t state; /**< RTE_ETH_QUEUE_STATE_* value. */
-	uint32_t rxq_fill_log_count; /**< RX queue fill threshold log count. */
+	struct rxq_fill_event *rxq_fill_events;
+	uint32_t rxq_fill_event_idx;
+	uint32_t rxq_fill_exceed_count;
+	uint32_t rxq_fill_max_count;
+	uint64_t rxq_fill_prev_poll_tsc;
+	uint8_t rxq_fill_armed;
 };
 
 /** TX queue configuration and state. */
@@ -384,6 +440,13 @@ struct rte_port {
  * The system CPU identifier of all logical cores are setup in a global
  * CPU id. configuration table.
  */
+#define MAINLOOP_EVENT_RING_DEFAULT 128
+
+struct mainloop_event {
+	uint64_t tsc;
+	uint64_t cycles;
+};
+
 struct fwd_lcore {
 #ifdef RTE_LIB_GSO
 	struct rte_gso_ctx gso_ctx;     /**< GSO context */
@@ -397,7 +460,10 @@ struct fwd_lcore {
 	lcoreid_t  cpuid_idx;    /**< index of logical core in CPU id table */
 	volatile char stopped;   /**< stop forwarding when set */
 	uint64_t total_cycles;   /**< used with --record-core-cycles */
-	uint32_t mainloop_log_count; /**< Mainloop cycle threshold log count */
+	struct mainloop_event *mainloop_events;
+	uint32_t mainloop_event_idx;
+	uint32_t mainloop_exceed_count;
+	uint64_t mainloop_max_cycles;
 };
 
 /*
@@ -509,9 +575,14 @@ extern uint8_t xstats_hide_zero; /**< Hide zero values for xstats display */
 extern uint8_t record_core_cycles; /**< Enables measurement of CPU cycles */
 extern uint8_t record_burst_stats; /**< Enables display of RX and TX bursts */
 extern uint32_t rxq_fill_threshold; /**< RX queue fill threshold count (0 = disabled) */
-extern uint32_t rxq_fill_log_limit; /**< Maximum RX queue fill logs allowed */
+extern uint8_t perf_counters_enabled;
+extern uint8_t pmu_event_enabled[RXQ_FILL_NUM_PMU_COUNTERS];
+extern __thread struct pmu_state lcore_pmu;
+extern uint32_t rxq_fill_event_ring_size; /**< Per-queue event ring size */
 extern uint64_t mainloop_cycle_threshold; /**< Mainloop cycle threshold (0 = disabled) */
-extern uint32_t mainloop_log_limit; /**< Maximum mainloop cycle logs allowed */
+extern uint32_t mainloop_event_ring_size; /**< Per-lcore event ring size */
+extern uint64_t ref_tsc; /**< TSC-to-wallclock reference: TSC value */
+extern struct timespec ref_ts; /**< TSC-to-wallclock reference: wall clock */
 extern uint16_t verbose_level; /**< Drives messages being displayed, if any. */
 extern int testpmd_logtype; /**< Log type for testpmd logs */
 extern uint8_t  interactive;
@@ -888,30 +959,66 @@ common_fwd_stream_receive(struct fwd_stream *fs, struct rte_mbuf **burst,
 	unsigned int nb_pkts)
 {
 	uint16_t nb_rx;
+	int queue_count = -1;
+	uint8_t recording = 0;
+	uint64_t pmu_delta[RXQ_FILL_NUM_PMU_COUNTERS] = {0};
+
+	if (perf_counters_enabled && lcore_pmu.enabled) {
+		int j;
+
+		for (j = 0; j < RXQ_FILL_NUM_PMU_COUNTERS; j++) {
+			uint64_t cur = pmu_read(&lcore_pmu.counters[j]);
+
+			pmu_delta[j] = cur - lcore_pmu.prev[j];
+			lcore_pmu.prev[j] = cur;
+		}
+	}
 
 	if (unlikely(rxq_fill_threshold > 0)) {
-		struct port_rxqueue *rxq = &ports[fs->rx_port].rxq[fs->rx_queue];
-
-		if (rxq->rxq_fill_log_count < rxq_fill_log_limit) {
-			int queue_count = rte_eth_rx_queue_count(fs->rx_port, fs->rx_queue);
-
-			if (queue_count >= 0 && (uint32_t)queue_count >= rxq_fill_threshold) {
-				struct timespec ts;
-				struct tm *tm_info;
-				char time_buf[64];
-
-				clock_gettime(CLOCK_REALTIME, &ts);
-				tm_info = localtime(&ts.tv_sec);
-				strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
-				printf("[%s.%09ld] RXQ fill threshold: port=%u queue=%u count=%d threshold=%u\n",
-					time_buf, ts.tv_nsec,
-					fs->rx_port, fs->rx_queue, queue_count, rxq_fill_threshold);
-				rxq->rxq_fill_log_count++;
-			}
+		struct port_rxqueue *rxq =
+			&ports[fs->rx_port].rxq[fs->rx_queue];
+		queue_count = rte_eth_rx_queue_count(fs->rx_port,
+						     fs->rx_queue);
+		if (queue_count >= 0) {
+			if (rxq->rxq_fill_armed &&
+			    (uint32_t)queue_count >= rxq_fill_threshold)
+				rxq->rxq_fill_armed = 0;
+			if (!rxq->rxq_fill_armed)
+				recording = 1;
 		}
 	}
 
 	nb_rx = rte_eth_rx_burst(fs->rx_port, fs->rx_queue, burst, nb_pkts);
+
+	if (unlikely(recording)) {
+		struct port_rxqueue *rxq =
+			&ports[fs->rx_port].rxq[fs->rx_queue];
+		uint64_t now_tsc = rte_rdtsc();
+
+		if (nb_rx > 0 &&
+		    rxq->rxq_fill_events != NULL &&
+		    rxq->rxq_fill_event_idx < rxq_fill_event_ring_size) {
+			uint32_t idx = rxq->rxq_fill_event_idx;
+			int j;
+
+			rxq->rxq_fill_events[idx].tsc = now_tsc;
+			rxq->rxq_fill_events[idx].gap_tsc =
+				rxq->rxq_fill_prev_poll_tsc > 0 ?
+				now_tsc - rxq->rxq_fill_prev_poll_tsc : 0;
+			rxq->rxq_fill_events[idx].queue_count = queue_count;
+			rxq->rxq_fill_events[idx].nb_rx = nb_rx;
+			for (j = 0; j < RXQ_FILL_NUM_PMU_COUNTERS; j++)
+				rxq->rxq_fill_events[idx].pmu[j] =
+					pmu_delta[j];
+			rxq->rxq_fill_event_idx++;
+		}
+		rxq->rxq_fill_prev_poll_tsc = now_tsc;
+		rxq->rxq_fill_exceed_count++;
+		if ((uint32_t)queue_count > rxq->rxq_fill_max_count)
+			rxq->rxq_fill_max_count = queue_count;
+		rxq->rxq_fill_armed = 0;
+	}
+
 	if (record_burst_stats)
 		fs->rx_burst_stats.pkt_burst_spread[nb_rx]++;
 	fs->rx_packets += nb_rx;
@@ -1147,7 +1254,12 @@ void set_xstats_hide_zero(uint8_t on_off);
 void set_record_core_cycles(uint8_t on_off);
 void set_record_burst_stats(uint8_t on_off);
 void set_rxq_fill_threshold(uint32_t threshold);
+void set_rxq_fill_event_ring_size(uint32_t size);
+void rxq_fill_stats_display(void);
+void rxq_fill_stats_reset(void);
+void set_perf_events(const char *event_list);
 void set_mainloop_cycle_threshold(uint64_t threshold);
+void set_mainloop_event_ring_size(uint32_t size);
 void set_verbose_level(uint16_t vb_level);
 void set_rx_pkt_segments(unsigned int *seg_lengths, unsigned int nb_segs);
 void set_rx_pkt_hdrs(unsigned int *seg_protos, unsigned int nb_segs);
@@ -1169,6 +1281,8 @@ void set_pkt_forwarding_mode(const char *fwd_mode);
 void start_packet_forwarding(int with_tx_first);
 void fwd_stats_display(void);
 void fwd_stats_reset(void);
+void mainloop_cycle_stats_display(void);
+void mainloop_cycle_stats_reset(void);
 void stop_packet_forwarding(void);
 void dev_set_link_up(portid_t pid);
 void dev_set_link_down(portid_t pid);

@@ -217,6 +217,12 @@ static void cmd_help_long_parsed(void *parsed_result,
 			"clear fwd stats all\n"
 			"    Clear statistics for all fwd engines.\n\n"
 
+			"show mainloop-cycle-stats\n"
+			"    Display per-lcore mainloop cycle threshold events.\n\n"
+
+			"clear mainloop-cycle-stats\n"
+			"    Clear per-lcore mainloop cycle threshold events.\n\n"
+
 			"show port (port_id) rx_offload capabilities\n"
 			"    List all per queue and per port Rx offloading"
 			" capabilities of a port\n\n"
@@ -579,12 +585,28 @@ static void cmd_help_long_parsed(void *parsed_result,
 			"set record-burst-stats on|off\n"
 			"    Set the option to enable display of RX and TX bursts.\n"
 
+			"set perf-event <events>\n"
+			"    Enable PMU events (comma-separated, 'all', or 'none').\n"
+			"    Events: mem_stall,l2_hit,llc_hit,llc_miss,itlb_walk,dtlb_walk\n"
+
 			"set rxq-fill-threshold (value)\n"
 			"    Set RX queue fill threshold for debug logging (0=disabled).\n"
+
+			"set rxq-fill-event-ring-size (value)\n"
+			"    Set per-queue event ring size (default 128, requires stop).\n"
+
+			"show rxq-fill-stats\n"
+			"    Display per-queue RXQ fill threshold events.\n\n"
+
+			"clear rxq-fill-stats\n"
+			"    Clear per-queue RXQ fill threshold events.\n"
 
 			"set mainloop-cycle-threshold (value)\n"
 			"    Set mainloop iteration cycle threshold for debug logging (0=disabled).\n"
 			"    Requires record-core-cycles to be enabled.\n"
+
+			"set mainloop-event-ring-size (value)\n"
+			"    Set per-lcore event ring size (default 128, requires stop).\n"
 
 			"set port (port_id) vf (vf_id) rx|tx on|off\n"
 			"    Enable/Disable a VF receive/transmit from a port\n\n"
@@ -8096,6 +8118,126 @@ static cmdline_parse_inst_t cmd_set_rxq_fill_threshold = {
 	},
 };
 
+/* *** SET PERF EVENT *** */
+struct cmd_set_perf_event_result {
+	cmdline_fixed_string_t set;
+	cmdline_fixed_string_t perf_event;
+	cmdline_fixed_string_t event_list;
+};
+
+static void
+cmd_set_perf_event_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_set_perf_event_result *res = parsed_result;
+
+	set_perf_events(res->event_list);
+}
+
+static cmdline_parse_token_string_t cmd_set_perf_event_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_perf_event_result,
+				 set, "set");
+static cmdline_parse_token_string_t cmd_set_perf_event_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_perf_event_result,
+				 perf_event, "perf-event");
+static cmdline_parse_token_string_t cmd_set_perf_event_list =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_perf_event_result,
+				 event_list, NULL);
+
+static cmdline_parse_inst_t cmd_set_perf_event = {
+	.f = cmd_set_perf_event_parsed,
+	.data = NULL,
+	.help_str = "set perf-event <events>: Enable PMU events "
+		    "(comma-separated: mem_stall,l2_hit,llc_hit,llc_miss,"
+		    "itlb_walk,dtlb_walk | all | none)",
+	.tokens = {
+		(void *)&cmd_set_perf_event_set,
+		(void *)&cmd_set_perf_event_name,
+		(void *)&cmd_set_perf_event_list,
+		NULL,
+	},
+};
+
+/* *** SET RXQ FILL EVENT RING SIZE *** */
+struct cmd_set_rxq_fill_event_ring_size_result {
+	cmdline_fixed_string_t set;
+	cmdline_fixed_string_t rxq_fill_event_ring_size;
+	uint32_t size;
+};
+
+static void
+cmd_set_rxq_fill_event_ring_size_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_set_rxq_fill_event_ring_size_result *res = parsed_result;
+
+	set_rxq_fill_event_ring_size(res->size);
+}
+
+static cmdline_parse_token_string_t cmd_set_rxq_fill_event_ring_size_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_rxq_fill_event_ring_size_result,
+				 set, "set");
+static cmdline_parse_token_string_t cmd_set_rxq_fill_event_ring_size_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_rxq_fill_event_ring_size_result,
+				 rxq_fill_event_ring_size,
+				 "rxq-fill-event-ring-size");
+static cmdline_parse_token_num_t cmd_set_rxq_fill_event_ring_size_value =
+	TOKEN_NUM_INITIALIZER(struct cmd_set_rxq_fill_event_ring_size_result,
+			      size, RTE_UINT32);
+
+static cmdline_parse_inst_t cmd_set_rxq_fill_event_ring_size = {
+	.f = cmd_set_rxq_fill_event_ring_size_parsed,
+	.data = NULL,
+	.help_str = "set rxq-fill-event-ring-size <value>: Set per-queue "
+		    "event ring size (default 128, requires stop)",
+	.tokens = {
+		(void *)&cmd_set_rxq_fill_event_ring_size_set,
+		(void *)&cmd_set_rxq_fill_event_ring_size_name,
+		(void *)&cmd_set_rxq_fill_event_ring_size_value,
+		NULL,
+	},
+};
+
+/* *** SHOW/CLEAR RXQ FILL STATS *** */
+struct cmd_rxq_fill_stats_result {
+	cmdline_fixed_string_t action;
+	cmdline_fixed_string_t rxq_fill_stats;
+};
+
+static void
+cmd_rxq_fill_stats_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_rxq_fill_stats_result *res = parsed_result;
+
+	if (!strcmp(res->action, "show"))
+		rxq_fill_stats_display();
+	else
+		rxq_fill_stats_reset();
+}
+
+static cmdline_parse_token_string_t cmd_rxq_fill_stats_action =
+	TOKEN_STRING_INITIALIZER(struct cmd_rxq_fill_stats_result,
+				 action, "show#clear");
+static cmdline_parse_token_string_t cmd_rxq_fill_stats_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_rxq_fill_stats_result,
+				 rxq_fill_stats, "rxq-fill-stats");
+
+static cmdline_parse_inst_t cmd_show_rxq_fill_stats = {
+	.f = cmd_rxq_fill_stats_parsed,
+	.data = NULL,
+	.help_str = "show|clear rxq-fill-stats: Display or clear "
+		    "per-queue RXQ fill threshold events",
+	.tokens = {
+		(void *)&cmd_rxq_fill_stats_action,
+		(void *)&cmd_rxq_fill_stats_name,
+		NULL,
+	},
+};
+
 /* *** SET MAINLOOP CYCLE THRESHOLD *** */
 struct cmd_set_mainloop_cycle_threshold_result {
 	cmdline_fixed_string_t set;
@@ -8132,6 +8274,85 @@ static cmdline_parse_inst_t cmd_set_mainloop_cycle_threshold = {
 		(void *)&cmd_set_mainloop_cycle_threshold_set,
 		(void *)&cmd_set_mainloop_cycle_threshold_name,
 		(void *)&cmd_set_mainloop_cycle_threshold_value,
+		NULL,
+	},
+};
+
+/* *** SET MAINLOOP EVENT RING SIZE *** */
+struct cmd_set_mainloop_event_ring_size_result {
+	cmdline_fixed_string_t set;
+	cmdline_fixed_string_t mainloop_event_ring_size;
+	uint32_t size;
+};
+
+static void
+cmd_set_mainloop_event_ring_size_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_set_mainloop_event_ring_size_result *res = parsed_result;
+
+	set_mainloop_event_ring_size(res->size);
+}
+
+static cmdline_parse_token_string_t cmd_set_mainloop_event_ring_size_set =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_mainloop_event_ring_size_result,
+				 set, "set");
+static cmdline_parse_token_string_t cmd_set_mainloop_event_ring_size_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_set_mainloop_event_ring_size_result,
+				 mainloop_event_ring_size,
+				 "mainloop-event-ring-size");
+static cmdline_parse_token_num_t cmd_set_mainloop_event_ring_size_value =
+	TOKEN_NUM_INITIALIZER(struct cmd_set_mainloop_event_ring_size_result,
+			      size, RTE_UINT32);
+
+static cmdline_parse_inst_t cmd_set_mainloop_event_ring_size = {
+	.f = cmd_set_mainloop_event_ring_size_parsed,
+	.data = NULL,
+	.help_str = "set mainloop-event-ring-size <value>: Set per-lcore "
+		    "event ring size (default 128, requires stop)",
+	.tokens = {
+		(void *)&cmd_set_mainloop_event_ring_size_set,
+		(void *)&cmd_set_mainloop_event_ring_size_name,
+		(void *)&cmd_set_mainloop_event_ring_size_value,
+		NULL,
+	},
+};
+
+/* *** SHOW/CLEAR MAINLOOP CYCLE STATS *** */
+struct cmd_mainloop_cycle_stats_result {
+	cmdline_fixed_string_t action;
+	cmdline_fixed_string_t mainloop_cycle_stats;
+};
+
+static void
+cmd_mainloop_cycle_stats_parsed(void *parsed_result,
+			__rte_unused struct cmdline *cl,
+			__rte_unused void *data)
+{
+	struct cmd_mainloop_cycle_stats_result *res = parsed_result;
+
+	if (!strcmp(res->action, "show"))
+		mainloop_cycle_stats_display();
+	else
+		mainloop_cycle_stats_reset();
+}
+
+static cmdline_parse_token_string_t cmd_mainloop_cycle_stats_action =
+	TOKEN_STRING_INITIALIZER(struct cmd_mainloop_cycle_stats_result,
+				 action, "show#clear");
+static cmdline_parse_token_string_t cmd_mainloop_cycle_stats_name =
+	TOKEN_STRING_INITIALIZER(struct cmd_mainloop_cycle_stats_result,
+				 mainloop_cycle_stats, "mainloop-cycle-stats");
+
+static cmdline_parse_inst_t cmd_show_mainloop_cycle_stats = {
+	.f = cmd_mainloop_cycle_stats_parsed,
+	.data = NULL,
+	.help_str = "show|clear mainloop-cycle-stats: Display or clear "
+		    "per-lcore mainloop cycle threshold events",
+	.tokens = {
+		(void *)&cmd_mainloop_cycle_stats_action,
+		(void *)&cmd_mainloop_cycle_stats_name,
 		NULL,
 	},
 };
@@ -13747,8 +13968,13 @@ static cmdline_parse_ctx_t builtin_ctx[] = {
 	&cmd_set_xstats_hide_zero,
 	&cmd_set_record_core_cycles,
 	&cmd_set_record_burst_stats,
+	&cmd_set_perf_event,
 	&cmd_set_rxq_fill_threshold,
+	&cmd_set_rxq_fill_event_ring_size,
+	&cmd_show_rxq_fill_stats,
 	&cmd_set_mainloop_cycle_threshold,
+	&cmd_set_mainloop_event_ring_size,
+	&cmd_show_mainloop_cycle_stats,
 	&cmd_operate_port,
 	&cmd_operate_specific_port,
 	&cmd_operate_attach_port,

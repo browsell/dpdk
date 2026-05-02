@@ -32,6 +32,7 @@
 #include <rte_per_lcore.h>
 #include <rte_lcore.h>
 #include <rte_branch_prediction.h>
+#include <rte_malloc.h>
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 #include <rte_interrupts.h>
@@ -6851,11 +6852,64 @@ set_rxq_fill_threshold(uint32_t threshold)
 
 	rxq_fill_threshold = threshold;
 
-	/* Reset all per-queue log counters */
 	RTE_ETH_FOREACH_DEV(port_id) {
-		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1; queue_id++)
-			ports[port_id].rxq[queue_id].rxq_fill_log_count = 0;
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1;
+		     queue_id++) {
+			struct port_rxqueue *rxq =
+				&ports[port_id].rxq[queue_id];
+
+			if (rxq->rxq_fill_events != NULL)
+				memset(rxq->rxq_fill_events, 0,
+				       sizeof(struct rxq_fill_event) *
+				       rxq_fill_event_ring_size);
+			rxq->rxq_fill_event_idx = 0;
+			rxq->rxq_fill_exceed_count = 0;
+			rxq->rxq_fill_max_count = 0;
+			rxq->rxq_fill_armed = 1;
+			rxq->rxq_fill_prev_poll_tsc = 0;
+		}
 	}
+}
+
+void
+set_rxq_fill_event_ring_size(uint32_t size)
+{
+	portid_t port_id;
+	queueid_t queue_id;
+
+	if (size == 0) {
+		fprintf(stderr, "Ring size must be > 0\n");
+		return;
+	}
+
+	if (test_done == 0) {
+		fprintf(stderr,
+			"Stop forwarding before changing ring size\n");
+		return;
+	}
+
+	rxq_fill_event_ring_size = size;
+
+	RTE_ETH_FOREACH_DEV(port_id) {
+		for (queue_id = 0; queue_id < RTE_MAX_QUEUES_PER_PORT + 1;
+		     queue_id++) {
+			struct port_rxqueue *rxq =
+				&ports[port_id].rxq[queue_id];
+
+			rte_free(rxq->rxq_fill_events);
+			rxq->rxq_fill_events = rte_zmalloc_socket(
+				"testpmd: rxq_fill_events",
+				sizeof(struct rxq_fill_event) * size,
+				RTE_CACHE_LINE_SIZE,
+				ports[port_id].socket_id);
+			rxq->rxq_fill_event_idx = 0;
+			rxq->rxq_fill_exceed_count = 0;
+			rxq->rxq_fill_max_count = 0;
+			rxq->rxq_fill_armed = 1;
+			rxq->rxq_fill_prev_poll_tsc = 0;
+		}
+	}
+	printf("RXQ fill event ring size set to %u\n", size);
 }
 
 void
@@ -6865,9 +6919,50 @@ set_mainloop_cycle_threshold(uint64_t threshold)
 
 	mainloop_cycle_threshold = threshold;
 
-	/* Reset all per-lcore log counters */
-	for (lc_id = 0; lc_id < nb_fwd_lcores; lc_id++)
-		fwd_lcores[lc_id]->mainloop_log_count = 0;
+	for (lc_id = 0; lc_id < nb_fwd_lcores; lc_id++) {
+		memset(fwd_lcores[lc_id]->mainloop_events, 0,
+		       sizeof(struct mainloop_event) * mainloop_event_ring_size);
+		fwd_lcores[lc_id]->mainloop_event_idx = 0;
+		fwd_lcores[lc_id]->mainloop_exceed_count = 0;
+		fwd_lcores[lc_id]->mainloop_max_cycles = 0;
+	}
+}
+
+void
+set_mainloop_event_ring_size(uint32_t size)
+{
+	lcoreid_t lc_id;
+
+	if (size == 0) {
+		fprintf(stderr, "Ring size must be > 0\n");
+		return;
+	}
+
+	if (test_done == 0) {
+		fprintf(stderr,
+			"Stop forwarding before changing ring size\n");
+		return;
+	}
+
+	mainloop_event_ring_size = size;
+
+	for (lc_id = 0; lc_id < nb_fwd_lcores; lc_id++) {
+		rte_free(fwd_lcores[lc_id]->mainloop_events);
+		fwd_lcores[lc_id]->mainloop_events =
+			rte_zmalloc_socket("testpmd: mainloop_events",
+				    sizeof(struct mainloop_event) * size,
+				    RTE_CACHE_LINE_SIZE,
+				    rte_lcore_to_socket_id(
+					    fwd_lcores_cpuids[
+					    fwd_lcores[lc_id]->cpuid_idx]));
+		if (fwd_lcores[lc_id]->mainloop_events == NULL)
+			rte_exit(EXIT_FAILURE,
+				 "rte_zmalloc_socket(mainloop_events) failed\n");
+		fwd_lcores[lc_id]->mainloop_event_idx = 0;
+		fwd_lcores[lc_id]->mainloop_exceed_count = 0;
+		fwd_lcores[lc_id]->mainloop_max_cycles = 0;
+	}
+	printf("Mainloop event ring size set to %u\n", size);
 }
 
 uint16_t
